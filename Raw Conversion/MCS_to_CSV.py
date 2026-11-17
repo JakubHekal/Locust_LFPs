@@ -244,9 +244,16 @@ def _segments(time_stamps: np.ndarray, tick_us: int) -> list[dict]:
 
 def _time_for_block(segments: list[dict], tick_us: int, start: int, stop: int,
                     continuous: bool, fs: float) -> np.ndarray:
-    idx = np.arange(start, stop, dtype=np.int64)
     if continuous:
-        return idx / fs
+        return np.arange(start, stop, dtype=np.int64) / fs
+    # Single-segment files need no segment search; this is the common case.
+    # The arithmetic matches the general path exactly, so output is unchanged.
+    if len(segments) == 1:
+        seg = segments[0]
+        if seg["first_index"] == 0 and start >= 0 and stop <= seg["count"]:
+            positions = np.arange(start, stop, dtype=np.float64)
+            return (seg["start_us"] + positions * tick_us * MCS_TICK_US) / 1e6
+    idx = np.arange(start, stop, dtype=np.int64)
     starts = np.array([seg["first_index"] for seg in segments], dtype=np.int64)
     seg_ids = np.searchsorted(starts, idx, side="right") - 1
     seg_ids = np.clip(seg_ids, 0, len(segments) - 1)

@@ -104,6 +104,51 @@ MARKER_COLUMN_TOKENS = (
     "sync",
 )
 
+SPIKE_EVENT_COLUMNS = (
+    "recording_index",
+    "recording_order",
+    "preparation_id",
+    "segment_id",
+    "recording_id",
+    "recording_name",
+    "epoch_label",
+    "phase",
+    "channel",
+    "unit_id",
+    "event_index",
+    "spike_time_s",
+    "segment_spike_time_s",
+    "recording_relative_spike_time_s",
+    "source_sampling_rate_hz",
+    "sample_index",
+    "canonical_sample_index",
+    "original_sample_index",
+    "candidate_sample_index",
+    "alignment_shift_samples",
+    "candidate_polarity",
+    "polarity",
+    "polarity_short",
+    "requested_polarity",
+    "amplitude_uv",
+    "signed_amplitude_uv",
+    "robust_z",
+    "candidate_robust_z",
+    "local_max_uv",
+    "local_max_sample_index",
+    "local_min_uv",
+    "local_min_sample_index",
+    "n_positive",
+    "n_negative",
+    "threshold_z",
+    "refractory_ms",
+    "classification_window_ms",
+    "amp_min_uv",
+    "amp_max_uv",
+    "qc_pass",
+    "qc_reason",
+    "source_file",
+)
+
 POLARITY_ALIASES = {
     "all": "both",
     "all spikes": "both",
@@ -2185,6 +2230,236 @@ def _metadata_for_path(csv_path, lookup):
     )
 
 
+def _process_channel_signal(
+    x_uv,
+    t,
+    ch,
+    rec_name,
+    source_file,
+    rec_idx,
+    epoch_label,
+    phase,
+    phase_group,
+    phase_warning_reason,
+    preparation_id,
+    segment_id,
+    metadata_present,
+    selected_polarity,
+    shape_config,
+    classification_window_ms,
+    selected_window_sec,
+    out_dir,
+    include_diagnostics=True,
+    include_amplitude=True,
+):
+    """Detect and describe spikes for one channel; shared by CSV and HDF5 inputs."""
+    results_rows = []
+    spike_event_rows = []
+    diagnostic_output_rows = []
+    waveform_summary_rows = []
+    shape_audit_dirs = []
+    amplitude_recording_rows = []
+    amplitude_event_rows = []
+    amplitude_waveform_rows = []
+
+    print(f"[detect] {rec_name} | {ch}: {len(t):,} samples", flush=True)
+    x = np.asarray(x_uv, dtype=float)
+
+    if np.any(~np.isfinite(x)):
+        s = pd.Series(x)
+        x = s.interpolate(limit_direction="both").to_numpy(dtype=float)
+
+    t0 = float(t[0])
+    t1 = float(t[-1])
+    details = detect_spikes_with_details(
+        x,
+        t,
+        polarity=selected_polarity,
+        return_filtered_trace=include_diagnostics or shape_config["mode"] != "off",
+        classification_window_ms=classification_window_ms,
+        shape_settings=shape_config,
+    )
+    peaks = details["peaks"]
+    spike_times = details["spike_times"]
+    fs = details["fs"]
+    event_polarities = np.asarray(details.get("event_polarity", []), dtype=str)
+    positive_times = spike_times[event_polarities == "pos"] if spike_times.size else np.array([], dtype=float)
+    negative_times = spike_times[event_polarities == "neg"] if spike_times.size else np.array([], dtype=float)
+    n_positive_total = int(details.get("n_positive", positive_times.size))
+    n_negative_total = int(details.get("n_negative", negative_times.size))
+    if include_amplitude:
+        recording_key = f"{rec_idx}::{ch}"
+        amplitude_recording_rows.append(
+            spike_amplitude_recording_row(
+                recording_key=recording_key,
+                rec_idx=rec_idx,
+                rec_name=rec_name,
+                channel=ch,
+                epoch_label=epoch_label,
+                phase=phase,
+                phase_group=phase_group,
+                phase_warning_reason=phase_warning_reason,
+                t_s=t,
+                fs=fs,
+            )
+        )
+        amplitude_event_rows.extend(
+            spike_amplitude_event_rows(
+                recording_key=recording_key,
+                rec_idx=rec_idx,
+                rec_name=rec_name,
+                channel=ch,
+                epoch_label=epoch_label,
+                phase=phase,
+                phase_group=phase_group,
+                phase_warning_reason=phase_warning_reason,
+                t0=t0,
+                details=details,
+            )
+        )
+        amplitude_waveform_rows.extend(spike_amplitude_waveform_rows(ch, phase_group, details))
+    if include_diagnostics:
+        outputs, waveform_summaries = write_spike_diagnostic_outputs(
+            out_dir, rec_name, ch, details
+        )
+        diagnostic_output_rows.extend(outputs)
+        for waveform_summary in waveform_summaries:
+            waveform_summary.update(
+                {
+                    "recording_index": rec_idx,
+                    "recording_order": rec_idx,
+                    "epoch_label": epoch_label,
+                    "phase": phase,
+                    "preparation_id": preparation_id,
+                    "segment_id": segment_id,
+                    "source_file": source_file,
+                }
+            )
+            waveform_summary_rows.append(waveform_summary)
+
+    for event_index, sample_index in enumerate(peaks, start=1):
+        spike_time = float(details["spike_times"][event_index - 1])
+        polarity_short = str(details["event_polarity"][event_index - 1])
+        spike_event_rows.append(
+            {
+                    "recording_index": rec_idx,
+                    "recording_order": rec_idx,
+                    "preparation_id": preparation_id,
+                    "segment_id": segment_id,
+                    "recording_id": rec_name,
+                    "recording_name": rec_name,
+                    "epoch_label": epoch_label,
+                    "phase": phase,
+                    "channel": ch,
+                    "unit_id": "threshold_mua",
+                    "event_index": event_index,
+                    "spike_time_s": spike_time,
+                    "segment_spike_time_s": float(spike_time - t0),
+                    "recording_relative_spike_time_s": float(spike_time - t0),
+                    "source_sampling_rate_hz": float(fs),
+                    "sample_index": int(sample_index),
+                    "canonical_sample_index": int(sample_index),
+                    "original_sample_index": int(sample_index),
+                    "candidate_sample_index": int(details["candidate_sample_index"][event_index - 1]),
+                    "alignment_shift_samples": int(details["alignment_shift_samples"][event_index - 1]),
+                    "candidate_polarity": str(details["candidate_polarity"][event_index - 1]),
+                    "polarity": EVENT_POLARITY_LABELS.get(polarity_short, polarity_short),
+                    "polarity_short": polarity_short,
+                    "requested_polarity": selected_polarity,
+                    "amplitude_uv": float(details["amplitude_uv"][event_index - 1]),
+                    "signed_amplitude_uv": float(details["signed_amplitude_uv"][event_index - 1]),
+                    "robust_z": float(details["robust_z"][event_index - 1]),
+                    "candidate_robust_z": float(details["candidate_robust_z"][event_index - 1]),
+                    "local_max_uv": float(details["local_max_uv"][event_index - 1]),
+                    "local_max_sample_index": int(details["local_max_sample_index"][event_index - 1]),
+                    "local_min_uv": float(details["local_min_uv"][event_index - 1]),
+                    "local_min_sample_index": int(details["local_min_sample_index"][event_index - 1]),
+                    "n_positive": n_positive_total,
+                    "n_negative": n_negative_total,
+                    "threshold_z": float(SPIKE_Z_THR),
+                    "refractory_ms": float(REFRACTORY_MS),
+                    "classification_window_ms": float(details.get("classification_window_ms", SPIKE_CLASSIFICATION_WINDOW_MS)),
+                    "amp_min_uv": AMP_MIN_UV,
+                    "amp_max_uv": AMP_MAX_UV,
+                    "qc_pass": True,
+                    "qc_reason": "threshold_crossing_mua",
+                    "source_file": source_file,
+                }
+            )
+    print(
+        f"[{rec_name} | {ch}] detected spikes: {len(spike_times)} "
+        f"(positive={n_positive_total}, negative={n_negative_total}, fs~{fs:.2f} Hz)"
+    )
+
+    sample_interval_s = 1.0 / float(fs) if np.isfinite(fs) and fs > 0 else 0.0
+    window_bounds = folded_window_bounds(t0, t1, selected_window_sec, sample_interval_s)
+    if include_diagnostics and shape_config["mode"] != "off":
+        with PLOT_LOCK:
+            shape_audit_dirs.append(shape_qc.write_audit(
+                Path(out_dir) / "spike_shape_qc" / shape_config["mode"] / f"{rec_idx:03d}_{_safe_name(rec_name)}" / _safe_name(ch),
+                rec_name, ch, details["filtered_trace_uv"], t, fs, details["shape_reports"],
+                details["shape_before_peaks"], peaks, window_bounds, shape_config))
+
+    for w, (a, b) in enumerate(window_bounds):
+        cnt = int(np.sum((spike_times >= a) & (spike_times < b)))
+        start_min = (a - t0) / 60.0
+        end_min = (b - t0) / 60.0
+
+        row = {
+            "recording_index": rec_idx,
+            "recording_order": rec_idx,
+            "recording_name": rec_name,
+            "epoch_label": epoch_label,
+            "phase": phase,
+            "channel": ch,
+            "window_index": w,
+            "window_start_s": a,
+            "window_end_s": b,
+            "segment_window_start_s": a - t0,
+            "segment_window_end_s": b - t0,
+            "segment_window_mid_s": ((a + b) / 2.0) - t0,
+            "window_duration_s": b - a,
+            "window_label": f"Min {start_min:g}-{end_min:g}",
+            "spike_count": cnt,
+            "n_positive": int(np.sum((positive_times >= a) & (positive_times < b))),
+            "n_negative": int(np.sum((negative_times >= a) & (negative_times < b))),
+            "fs_est_hz": float(fs),
+            "source_sampling_rate_hz": float(fs),
+            "z_thr": float(SPIKE_Z_THR),
+            "polarity": selected_polarity,
+            "refractory_ms": float(REFRACTORY_MS),
+            "classification_window_ms": float(details.get("classification_window_ms", SPIKE_CLASSIFICATION_WINDOW_MS)),
+            "hp_lo_hz": float(HP_SPIKE_BAND[0]),
+            "hp_hi_hz": float(HP_SPIKE_BAND[1]),
+            "amp_min_uv": AMP_MIN_UV,
+            "amp_max_uv": AMP_MAX_UV,
+            "w_min_ms": W_MIN_MS,
+            "w_max_ms": W_MAX_MS,
+        }
+        if metadata_present:
+            row.update(
+                {
+                    "preparation_id": preparation_id,
+                    "segment_id": segment_id,
+                    "recording_id": rec_name,
+                    "source_file": source_file,
+                }
+            )
+        results_rows.append(row)
+
+
+    return {
+        "results_rows": results_rows,
+        "spike_event_rows": spike_event_rows,
+        "diagnostic_output_rows": diagnostic_output_rows,
+        "waveform_summary_rows": waveform_summary_rows,
+        "shape_audit_dirs": shape_audit_dirs,
+        "amplitude_recording_rows": amplitude_recording_rows,
+        "amplitude_event_rows": amplitude_event_rows,
+        "amplitude_waveform_rows": amplitude_waveform_rows,
+    }
+
+
 def _process_one_recording(
     csv_path,
     rec_idx,
@@ -2244,189 +2519,21 @@ def _process_one_recording(
         )
 
     for ch in chan_cols:
-        print(f"[detect] {rec_name} | {ch}: {len(t):,} samples", flush=True)
         x = df[ch].to_numpy(dtype=float)
-
-        if np.any(~np.isfinite(x)):
-            s = pd.Series(x)
-            x = s.interpolate(limit_direction="both").to_numpy(dtype=float)
-
-        t0 = float(t[0])
-        t1 = float(t[-1])
-        details = detect_spikes_with_details(
-            x,
-            t,
-            polarity=selected_polarity,
-            return_filtered_trace=True,
-            classification_window_ms=classification_window_ms,
-            shape_settings=shape_config,
+        bundle = _process_channel_signal(
+            x, t, ch, rec_name, csv_path, rec_idx, epoch_label, phase,
+            phase_group, phase_warning_reason, preparation_id, segment_id,
+            bool(rec_meta), selected_polarity, shape_config,
+            classification_window_ms, selected_window_sec, out_dir,
         )
-        peaks = details["peaks"]
-        spike_times = details["spike_times"]
-        fs = details["fs"]
-        event_polarities = np.asarray(details.get("event_polarity", []), dtype=str)
-        positive_times = spike_times[event_polarities == "pos"] if spike_times.size else np.array([], dtype=float)
-        negative_times = spike_times[event_polarities == "neg"] if spike_times.size else np.array([], dtype=float)
-        n_positive_total = int(details.get("n_positive", positive_times.size))
-        n_negative_total = int(details.get("n_negative", negative_times.size))
-        recording_key = f"{rec_idx}::{ch}"
-        amplitude_recording_rows.append(
-            spike_amplitude_recording_row(
-                recording_key=recording_key,
-                rec_idx=rec_idx,
-                rec_name=rec_name,
-                channel=ch,
-                epoch_label=epoch_label,
-                phase=phase,
-                phase_group=phase_group,
-                phase_warning_reason=phase_warning_reason,
-                t_s=t,
-                fs=fs,
-            )
-        )
-        amplitude_event_rows.extend(
-            spike_amplitude_event_rows(
-                recording_key=recording_key,
-                rec_idx=rec_idx,
-                rec_name=rec_name,
-                channel=ch,
-                epoch_label=epoch_label,
-                phase=phase,
-                phase_group=phase_group,
-                phase_warning_reason=phase_warning_reason,
-                t0=t0,
-                details=details,
-            )
-        )
-        amplitude_waveform_rows.extend(spike_amplitude_waveform_rows(ch, phase_group, details))
-        outputs, waveform_summaries = write_spike_diagnostic_outputs(
-            out_dir, rec_name, ch, details
-        )
-        diagnostic_output_rows.extend(outputs)
-        for waveform_summary in waveform_summaries:
-            waveform_summary.update(
-                {
-                    "recording_index": rec_idx,
-                    "recording_order": rec_idx,
-                    "epoch_label": epoch_label,
-                    "phase": phase,
-                    "preparation_id": preparation_id,
-                    "segment_id": segment_id,
-                    "source_file": csv_path,
-                }
-            )
-            waveform_summary_rows.append(waveform_summary)
-
-        for event_index, sample_index in enumerate(peaks, start=1):
-            spike_time = float(details["spike_times"][event_index - 1])
-            polarity_short = str(details["event_polarity"][event_index - 1])
-            spike_event_rows.append(
-                {
-                        "recording_index": rec_idx,
-                        "recording_order": rec_idx,
-                        "preparation_id": preparation_id,
-                        "segment_id": segment_id,
-                        "recording_id": rec_name,
-                        "recording_name": rec_name,
-                        "epoch_label": epoch_label,
-                        "phase": phase,
-                        "channel": ch,
-                        "unit_id": "threshold_mua",
-                        "event_index": event_index,
-                        "spike_time_s": spike_time,
-                        "segment_spike_time_s": float(spike_time - t0),
-                        "recording_relative_spike_time_s": float(spike_time - t0),
-                        "source_sampling_rate_hz": float(fs),
-                        "sample_index": int(sample_index),
-                        "canonical_sample_index": int(sample_index),
-                        "original_sample_index": int(sample_index),
-                        "candidate_sample_index": int(details["candidate_sample_index"][event_index - 1]),
-                        "alignment_shift_samples": int(details["alignment_shift_samples"][event_index - 1]),
-                        "candidate_polarity": str(details["candidate_polarity"][event_index - 1]),
-                        "polarity": EVENT_POLARITY_LABELS.get(polarity_short, polarity_short),
-                        "polarity_short": polarity_short,
-                        "requested_polarity": selected_polarity,
-                        "amplitude_uv": float(details["amplitude_uv"][event_index - 1]),
-                        "signed_amplitude_uv": float(details["signed_amplitude_uv"][event_index - 1]),
-                        "robust_z": float(details["robust_z"][event_index - 1]),
-                        "candidate_robust_z": float(details["candidate_robust_z"][event_index - 1]),
-                        "local_max_uv": float(details["local_max_uv"][event_index - 1]),
-                        "local_max_sample_index": int(details["local_max_sample_index"][event_index - 1]),
-                        "local_min_uv": float(details["local_min_uv"][event_index - 1]),
-                        "local_min_sample_index": int(details["local_min_sample_index"][event_index - 1]),
-                        "n_positive": n_positive_total,
-                        "n_negative": n_negative_total,
-                        "threshold_z": float(SPIKE_Z_THR),
-                        "refractory_ms": float(REFRACTORY_MS),
-                        "classification_window_ms": float(details.get("classification_window_ms", SPIKE_CLASSIFICATION_WINDOW_MS)),
-                        "amp_min_uv": AMP_MIN_UV,
-                        "amp_max_uv": AMP_MAX_UV,
-                        "qc_pass": True,
-                        "qc_reason": "threshold_crossing_mua",
-                        "source_file": csv_path,
-                    }
-                )
-        print(
-            f"[{rec_name} | {ch}] detected spikes: {len(spike_times)} "
-            f"(positive={n_positive_total}, negative={n_negative_total}, fs~{fs:.2f} Hz)"
-        )
-
-        sample_interval_s = 1.0 / float(fs) if np.isfinite(fs) and fs > 0 else 0.0
-        window_bounds = folded_window_bounds(t0, t1, selected_window_sec, sample_interval_s)
-        if shape_config["mode"] != "off":
-            with PLOT_LOCK:
-                shape_audit_dirs.append(shape_qc.write_audit(
-                    Path(out_dir) / "spike_shape_qc" / shape_config["mode"] / f"{rec_idx:03d}_{_safe_name(rec_name)}" / _safe_name(ch),
-                    rec_name, ch, details["filtered_trace_uv"], t, fs, details["shape_reports"],
-                    details["shape_before_peaks"], peaks, window_bounds, shape_config))
-
-        for w, (a, b) in enumerate(window_bounds):
-            cnt = int(np.sum((spike_times >= a) & (spike_times < b)))
-            start_min = (a - t0) / 60.0
-            end_min = (b - t0) / 60.0
-
-            row = {
-                "recording_index": rec_idx,
-                "recording_order": rec_idx,
-                "recording_name": rec_name,
-                "epoch_label": epoch_label,
-                "phase": phase,
-                "channel": ch,
-                "window_index": w,
-                "window_start_s": a,
-                "window_end_s": b,
-                "segment_window_start_s": a - t0,
-                "segment_window_end_s": b - t0,
-                "segment_window_mid_s": ((a + b) / 2.0) - t0,
-                "window_duration_s": b - a,
-                "window_label": f"Min {start_min:g}-{end_min:g}",
-                "spike_count": cnt,
-                "n_positive": int(np.sum((positive_times >= a) & (positive_times < b))),
-                "n_negative": int(np.sum((negative_times >= a) & (negative_times < b))),
-                "fs_est_hz": float(fs),
-                "source_sampling_rate_hz": float(fs),
-                "z_thr": float(SPIKE_Z_THR),
-                "polarity": selected_polarity,
-                "refractory_ms": float(REFRACTORY_MS),
-                "classification_window_ms": float(details.get("classification_window_ms", SPIKE_CLASSIFICATION_WINDOW_MS)),
-                "hp_lo_hz": float(HP_SPIKE_BAND[0]),
-                "hp_hi_hz": float(HP_SPIKE_BAND[1]),
-                "amp_min_uv": AMP_MIN_UV,
-                "amp_max_uv": AMP_MAX_UV,
-                "w_min_ms": W_MIN_MS,
-                "w_max_ms": W_MAX_MS,
-            }
-            if rec_meta:
-                row.update(
-                    {
-                        "preparation_id": preparation_id,
-                        "segment_id": segment_id,
-                        "recording_id": rec_name,
-                        "source_file": csv_path,
-                    }
-                )
-            results_rows.append(row)
-
+        results_rows.extend(bundle["results_rows"])
+        spike_event_rows.extend(bundle["spike_event_rows"])
+        diagnostic_output_rows.extend(bundle["diagnostic_output_rows"])
+        waveform_summary_rows.extend(bundle["waveform_summary_rows"])
+        shape_audit_dirs.extend(bundle["shape_audit_dirs"])
+        amplitude_recording_rows.extend(bundle["amplitude_recording_rows"])
+        amplitude_event_rows.extend(bundle["amplitude_event_rows"])
+        amplitude_waveform_rows.extend(bundle["amplitude_waveform_rows"])
     return {
         "results_rows": results_rows,
         "spike_event_rows": spike_event_rows,
@@ -2537,51 +2644,7 @@ def process_csvs(
     out_table.to_csv(out_csv, index=False)
 
     events_csv = spike_events_path or os.path.join(out_dir, "spike_events.csv")
-    event_columns = [
-            "recording_index",
-            "recording_order",
-            "preparation_id",
-            "segment_id",
-            "recording_id",
-            "recording_name",
-            "epoch_label",
-            "phase",
-            "channel",
-            "unit_id",
-            "event_index",
-            "spike_time_s",
-            "segment_spike_time_s",
-            "recording_relative_spike_time_s",
-            "source_sampling_rate_hz",
-            "sample_index",
-            "canonical_sample_index",
-            "original_sample_index",
-            "candidate_sample_index",
-            "alignment_shift_samples",
-            "candidate_polarity",
-            "polarity",
-            "polarity_short",
-            "requested_polarity",
-            "amplitude_uv",
-            "signed_amplitude_uv",
-            "robust_z",
-            "candidate_robust_z",
-            "local_max_uv",
-            "local_max_sample_index",
-            "local_min_uv",
-            "local_min_sample_index",
-            "n_positive",
-            "n_negative",
-            "threshold_z",
-            "refractory_ms",
-            "classification_window_ms",
-            "amp_min_uv",
-            "amp_max_uv",
-            "qc_pass",
-            "qc_reason",
-            "source_file",
-        ]
-    pd.DataFrame(spike_event_rows, columns=event_columns).to_csv(events_csv, index=False)
+    pd.DataFrame(spike_event_rows, columns=SPIKE_EVENT_COLUMNS).to_csv(events_csv, index=False)
     print(f"[events] wrote threshold-crossing MUA spike events:\n  {events_csv}")
 
     amplitude_outputs = build_spike_amplitude_timecourse_outputs(

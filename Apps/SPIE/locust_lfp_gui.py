@@ -64,6 +64,7 @@ OVERLAY_SCRIPT = RUNTIME_ROOT / "Spike Processing" / "overlay_spike_counts_separ
 PLOT_SCRIPT = RUNTIME_ROOT / "Plotting and Utilities" / "plot_baseline_post_firing_rates.py"
 CSV_SPIKE_PLOT_SCRIPT = RUNTIME_ROOT / "Spike Processing" / "CSV_to_spike_counts.py"
 SPIKE_SCRIPT = RUNTIME_ROOT / "Spike Processing" / "Spike Count Multiple CSVs ordered.py"
+MCS_SPIKES_SCRIPT = RUNTIME_ROOT / "Spike Processing" / "MCS_to_spikes.py"
 RHS_SCRIPT = RUNTIME_ROOT / "Raw Conversion" / "RHS_to_CSV(simple).py"
 RHD_SCRIPT = RUNTIME_ROOT / "Raw Conversion" / "RHD_to_CSV (simple).py"
 MCS_SCRIPT = RUNTIME_ROOT / "Raw Conversion" / "MCS_to_CSV.py"
@@ -160,6 +161,7 @@ class SpikePipelineRequest:
     spike_events_path: str | None
     recording_metadata: list[dict]
     shape_settings: dict | None = None
+    channels: list[str] | None = None
 
 
 def _file_fingerprint(path: str | Path) -> dict:
@@ -272,6 +274,28 @@ def run_shared_spike_pipeline(request: SpikePipelineRequest, script_path: Path =
         "spike_processing_provenance": provenance,
         "spike_shape_audit_dirs": spike_outputs.get("spike_shape_audit_dirs", []),
     }
+
+
+def run_mcs_hdf5_spike_pipeline(request: SpikePipelineRequest) -> dict:
+    """Detect spikes directly from MCS HDF5 files; no raw CSV is written."""
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    module = load_script_module(
+        MCS_SPIKES_SCRIPT, f"mcs_to_spikes_shared_{threading.get_ident()}"
+    )
+    return module.process_hdf5s(
+        request.paths,
+        out_dir=request.out_dir,
+        epoch_labels_by_path=request.labels_by_path,
+        window_sec=request.window_sec,
+        polarity=request.polarity,
+        spike_events_path=request.spike_events_path,
+        recording_metadata_by_path=request.recording_metadata,
+        shape_settings=request.shape_settings,
+        return_outputs=True,
+        channels=request.channels,
+    )
 
 
 class Tooltip:
@@ -877,8 +901,10 @@ class LocustPipelineApp:
         order_box.columnconfigure(0, weight=1)
         order_box.rowconfigure(1, weight=1)
 
+        self.spike_source_var = tk.StringVar(value="CSV folder")
         self.spike_csv_dir_var = tk.StringVar(value=str(DEFAULT_DATA_DIR))
         self.spike_glob_var = tk.StringVar(value="*.csv")
+        self.spike_channels_var = tk.StringVar(value="")
         self.spike_window_var = tk.StringVar(value="1 min")
         self.spike_polarity_var = tk.StringVar(value="both")
         self.spike_shape_vars = {
@@ -897,11 +923,30 @@ class LocustPipelineApp:
         self.selection_count_var = tk.StringVar(value="0 of 0 selected")
 
         row = 0
-        self._path_row(settings, row, "CSV folder", self.spike_csv_dir_var, self._browse_spike_csv_dir)
+        ttk.Label(settings, text="Input source").grid(row=row, column=0, sticky="w", pady=4)
+        source = ttk.Combobox(
+            settings,
+            textvariable=self.spike_source_var,
+            values=("CSV folder", "MCS HDF5 folder"),
+            width=18,
+            state="readonly",
+        )
+        source.grid(row=row, column=1, sticky="w", pady=4)
+        source.bind("<<ComboboxSelected>>", self._on_spike_source_change)
+
         row += 1
-        ttk.Label(settings, text="CSV pattern").grid(row=row, column=0, sticky="w", pady=4)
+        self._path_row(settings, row, "Input folder", self.spike_csv_dir_var, self._browse_spike_csv_dir)
+        row += 1
+        ttk.Label(settings, text="File pattern").grid(row=row, column=0, sticky="w", pady=4)
         ttk.Entry(settings, textvariable=self.spike_glob_var, width=18).grid(row=row, column=1, sticky="w", pady=4)
         ttk.Button(settings, text="Refresh Files", style="Secondary.TButton", command=self.refresh_spike_files).grid(row=row, column=2, sticky="w", padx=8)
+
+        row += 1
+        ttk.Label(settings, text="Channels").grid(row=row, column=0, sticky="w", pady=4)
+        ttk.Entry(settings, textvariable=self.spike_channels_var, width=28).grid(row=row, column=1, sticky="w", pady=4)
+        ttk.Label(settings, text="Comma-separated labels, e.g. F7,F8. Blank = all.", style="Hint.TLabel").grid(
+            row=row, column=2, sticky="w", padx=8
+        )
 
         row += 1
         ttk.Label(settings, text="Spike-count window").grid(row=row, column=0, sticky="w", pady=4)
@@ -2205,6 +2250,16 @@ class LocustPipelineApp:
         if path:
             self.raw_chunk_output_csv_var.set(path)
 
+    def _spike_hdf5_mode(self) -> bool:
+        var = getattr(self, "spike_source_var", None)
+        return bool(var) and var.get().strip() == "MCS HDF5 folder"
+
+    def _on_spike_source_change(self, _event=None) -> None:
+        pattern = "*.h5" if self._spike_hdf5_mode() else "*.csv"
+        if self.spike_glob_var.get().strip() in ("", "*.csv", "*.h5"):
+            self.spike_glob_var.set(pattern)
+        self.refresh_spike_files()
+
     def _browse_spike_csv_dir(self) -> None:
         self._browse_directory_into(self.spike_csv_dir_var)
         self.refresh_spike_files()
@@ -2284,8 +2339,9 @@ class LocustPipelineApp:
         }
 
     def refresh_spike_files(self) -> None:
+        hdf5_mode = self._spike_hdf5_mode()
         csv_dir = self.spike_csv_dir_var.get().strip()
-        pattern = self.spike_glob_var.get().strip() or "*.csv"
+        pattern = self.spike_glob_var.get().strip() or ("*.h5" if hdf5_mode else "*.csv")
         paths = sorted(path for path in glob.glob(os.path.join(csv_dir, pattern)) if Path(path).is_file())
         path_key = lambda path: os.path.normcase(os.path.abspath(path))
         discovered = {path_key(path): path for path in paths}
@@ -2304,7 +2360,8 @@ class LocustPipelineApp:
         selected_indices = [index for index, item in enumerate(self.recordings) if path_key(item["path"]) in selected_paths]
         self._refresh_recording_listbox(selected_indices)
         self.on_recording_select()
-        self.log(f"Found {len(self.recordings)} CSV file(s) for spike counting.\n")
+        kind = "HDF5" if hdf5_mode else "CSV"
+        self.log(f"Found {len(self.recordings)} {kind} file(s) for spike counting.\n")
 
     def _refresh_recording_listbox(self, selected_indices: list[int] | None = None) -> None:
         self.recording_listbox.delete(0, "end")
@@ -2899,6 +2956,12 @@ class LocustPipelineApp:
         if not paths:
             raise FileNotFoundError("No CSV files were found for spike counting.")
         labels = dict(labels or {})
+        channels = None
+        channels_var = getattr(self, "spike_channels_var", None)
+        if self._spike_hdf5_mode() and channels_var is not None:
+            channels = [
+                label.strip() for label in channels_var.get().split(",") if label.strip()
+            ] or None
         selected_out_dir = out_dir if out_dir is not None else self.spike_out_dir_var.get().strip()
         selected_out_dir = selected_out_dir or str(Path(paths[0]).parent / "spike_counts_per_min")
         spike_events_path = str(Path(selected_out_dir) / "spike_events.csv")
@@ -2913,9 +2976,12 @@ class LocustPipelineApp:
             recording_metadata=metadata,
             shape_settings=load_script_module(SPIKE_SCRIPT, "spike_shape_settings").shape_qc.settings(
                 {key: var.get() for key, var in getattr(self, "spike_shape_vars", {}).items()}),
+            channels=channels,
         )
 
     def _perform_spike_counting(self, request: SpikePipelineRequest) -> dict:
+        if self._spike_hdf5_mode():
+            return run_mcs_hdf5_spike_pipeline(request)
         return run_shared_spike_pipeline(request)
 
     def _combine_source_paths(self) -> list[str]:
@@ -3362,7 +3428,10 @@ class LocustPipelineApp:
         if not self.recordings:
             self.refresh_spike_files()
         if not self.recordings:
-            messagebox.showerror("No CSV files", "No CSV files were found for spike counting.")
+            kind = "HDF5" if self._spike_hdf5_mode() else "CSV"
+            messagebox.showerror(
+                f"No {kind} files", f"No {kind} files were found for spike counting."
+            )
             return
         try:
             request = self._spike_pipeline_request()
