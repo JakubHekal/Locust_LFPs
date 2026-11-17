@@ -24,6 +24,7 @@ preserved. ``continuous_time=True`` ignores the stored timestamps and uses
 """
 
 import re
+import time
 from pathlib import Path
 
 import h5py
@@ -31,8 +32,127 @@ import numpy as np
 
 VOLTAGE_UNITS = {"v", "mv", "uv", "µv", "μv"}
 MCS_TICK_US = 1.0  # one MCS tick is 1 microsecond
-BLOCK_SAMPLES = 100_000
+BLOCK_SAMPLES = 250_000
+WRITE_CHUNK_ROWS = 50_000
+READ_MIN_SAMPLES = 25_000
+WRITE_MIN_ROWS = 10_000
+MEMORY_BUDGET_BYTES = 512 * 1024 * 1024
+TUNE_GROWTH = 2.0
+TUNE_DROP_FRACTION = 0.10
+TUNE_COOLDOWN_BLOCKS = 2
 TIME_FORMAT = "%.6f"
+
+
+class AdaptiveChunker:
+    """TCP-style batch sizing: grow until throughput drops, then halve."""
+
+    def __init__(self, label, initial, minimum, maximum, growth=TUNE_GROWTH,
+                 drop_fraction=TUNE_DROP_FRACTION, cooldown=TUNE_COOLDOWN_BLOCKS):
+        self.label = label
+        self.minimum = max(1, int(minimum))
+        self.maximum = max(self.minimum, int(maximum))
+        self.size = max(self.minimum, min(int(initial), self.maximum))
+        self.growth = float(growth)
+        self.drop_fraction = float(drop_fraction)
+        self.cooldown_blocks = int(cooldown)
+        self.cooldown_left = 0
+        self.smoothed_rate = None
+        self.peak_rate = 0.0
+
+    def next_size(self) -> int:
+        return self.size
+
+    def _change_line(self, old: int, reason: str, rate: float, drop_percent=0.0) -> str:
+        unit = "rows" if self.label == "write_chunk" else "samples"
+        details = (
+            f"{_format_rate(rate, unit)}, peak {_format_rate(self.peak_rate, unit)}"
+        )
+        if drop_percent:
+            details = f"{drop_percent:.0f}% below peak, {details}"
+        return (
+            f"[mcs] tune: {self.label} {old:,} -> {self.size:,} {unit} "
+            f"({reason}, {details})"
+        )
+
+    def observe(self, seconds: float, units: int):
+        """Update size from one measured batch. Return a log line on change."""
+        if seconds <= 0 or units <= 0:
+            return None
+        rate = float(units) / seconds
+        self.smoothed_rate = (
+            rate if self.smoothed_rate is None else 0.7 * self.smoothed_rate + 0.3 * rate
+        )
+        if self.smoothed_rate > self.peak_rate:
+            self.peak_rate = self.smoothed_rate
+
+        old = self.size
+        if self.cooldown_left > 0:
+            self.cooldown_left -= 1
+            return None
+
+        if self.peak_rate and self.smoothed_rate < self.peak_rate * (1.0 - self.drop_fraction):
+            drop_percent = 100.0 * (1.0 - self.smoothed_rate / self.peak_rate)
+            self.size = max(self.minimum, self.size // 2)
+            self.cooldown_left = self.cooldown_blocks
+            self.peak_rate = self.smoothed_rate
+            if self.size != old:
+                return self._change_line(old, "rate drop", rate, drop_percent)
+            return None
+
+        self.size = min(self.maximum, max(self.size + 1, int(self.size * self.growth)))
+        if self.size != old:
+            return self._change_line(old, "growth", rate)
+        return None
+
+
+def _read_tuner(n_channels: int, n_samples: int) -> AdaptiveChunker:
+    """Size one HDF5 read block under half the memory budget."""
+    n_channels = max(1, int(n_channels))
+    per_sample = 4 * n_channels + 8 * (2 * n_channels + 1)
+    budget_samples = max(1, (MEMORY_BUDGET_BYTES // 2) // per_sample)
+    maximum = max(1, min(int(n_samples), budget_samples))
+    minimum = min(READ_MIN_SAMPLES, maximum)
+    return AdaptiveChunker("read_block", min(BLOCK_SAMPLES, maximum), minimum, maximum)
+
+
+def _write_tuner(n_columns: int, block_samples: int) -> AdaptiveChunker:
+    """Size one formatted CSV chunk under half the memory budget."""
+    row_bytes = 2 * (max(2, int(n_columns)) * 12 + 56)
+    budget_rows = max(1, (MEMORY_BUDGET_BYTES // 2) // row_bytes)
+    maximum = max(1, min(int(block_samples), budget_rows, 1_000_000))
+    minimum = min(WRITE_MIN_ROWS, maximum)
+    return AdaptiveChunker("write_chunk", min(WRITE_CHUNK_ROWS, maximum), minimum, maximum)
+
+
+def _format_duration(seconds: float) -> str:
+    total = int(max(0, round(float(seconds))))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
+
+
+def _format_rate(rate: float, unit: str = "samples") -> str:
+    if rate >= 1_000_000:
+        return f"{rate / 1_000_000:.1f}M {unit}/s"
+    if rate >= 1_000:
+        return f"{rate / 1_000:.0f}k {unit}/s"
+    return f"{rate:.0f} {unit}/s"
+
+
+def _progress_line(done: int, total: int, elapsed: float, rate: float) -> str:
+    percent = 100.0 * done / total if total else 100.0
+    eta = _format_duration((total - done) / rate) if rate > 0 else "--:--"
+    return (
+        f"[mcs] {done:,}/{total:,} samples ({percent:.1f}%) "
+        f"elapsed {_format_duration(elapsed)} ETA {eta} {_format_rate(rate)}"
+    )
+
+
+def _print_tune(line) -> None:
+    if line:
+        print(line, flush=True)
 
 
 def _text(value) -> str:
@@ -306,6 +426,14 @@ def combine_mcs_to_one_csv(
         print(f"[mcs] writing {n_samples:,} rows, {len(chosen) + len(pairs)} "
               f"channels -> {out_path}", flush=True)
 
+        read_tuner = _read_tuner(len(chosen), n_samples)
+        write_columns = 2 if split_by_channel else len(chosen) + len(pairs) + 1
+        write_tuner = _write_tuner(write_columns, read_tuner.maximum)
+        print(f"[mcs] adaptive sizing: read_block={read_tuner.size:,} samples "
+              f"(range {read_tuner.minimum:,}-{read_tuner.maximum:,}), "
+              f"write_chunk={write_tuner.size:,} rows "
+              f"(range {write_tuner.minimum:,}-{write_tuner.maximum:,})", flush=True)
+
         scales = np.array([_unit_scale_to_uv(ch["unit"], ch["exponent"], ch["conversion_factor"])
                            for ch in meta], dtype=np.float64)
         ad_zeros = np.array([ch["ad_zero"] for ch in meta], dtype=np.float64)
@@ -332,11 +460,13 @@ def combine_mcs_to_one_csv(
                 _write_blocks(
                     data, selected_scale, selected_zero, channel_indices,
                     chosen, pairs, tick_us, fs, segments, continuous_time, window,
-                    split_writers=writers,
+                    split_writers=writers, read_tuner=read_tuner, write_tuner=write_tuner,
                 )
             finally:
                 for handle_out in writers.values():
                     handle_out.close()
+            print(f"[mcs] final sizing: read_block={read_tuner.size:,} samples, "
+                  f"write_chunk={write_tuner.size:,} rows", flush=True)
             print(f"[mcs] wrote {len(writers)} per-channel CSVs next to: {out_path}")
             return str(out_path)
 
@@ -346,8 +476,11 @@ def combine_mcs_to_one_csv(
             _write_blocks(
                 data, selected_scale, selected_zero, channel_indices,
                 chosen, pairs, tick_us, fs, segments, continuous_time, window,
-                wide_writer=handle_out,
+                wide_writer=handle_out, read_tuner=read_tuner, write_tuner=write_tuner,
             )
+
+        print(f"[mcs] final sizing: read_block={read_tuner.size:,} samples, "
+              f"write_chunk={write_tuner.size:,} rows", flush=True)
 
     print(f"[mcs] saved: {out_path}")
     return str(out_path)
@@ -355,18 +488,30 @@ def combine_mcs_to_one_csv(
 
 def _write_blocks(data, scales, zeros, channel_indices, chosen, pairs,
                   tick_us, fs, segments, continuous_time, window, split_writers=None,
-                  wide_writer=None):
+                  wide_writer=None, read_tuner=None, write_tuner=None):
     n_samples = int(data.shape[1])
     sorted_indices = np.sort(np.asarray(channel_indices))
     order = np.searchsorted(sorted_indices, channel_indices)
-    for start in range(0, n_samples, BLOCK_SAMPLES):
-        stop = min(start + BLOCK_SAMPLES, n_samples)
+    started = time.monotonic()
+    start = 0
+    while start < n_samples:
+        span = min(read_tuner.next_size() if read_tuner else BLOCK_SAMPLES,
+                   n_samples - start)
+        stop = start + span
+        read_started = time.monotonic()
         t = _time_for_block(segments, tick_us, start, stop, continuous_time, fs)
 
-        lo, hi = 0, stop - start
+        lo, hi = 0, span
         if window is not None:
             inside = np.flatnonzero((t >= window[0]) & (t < window[1]))
             if inside.size == 0:
+                read_elapsed = time.monotonic() - read_started
+                if read_tuner and span >= read_tuner.size:
+                    _print_tune(read_tuner.observe(read_elapsed, span))
+                elapsed = time.monotonic() - started
+                rate = stop / elapsed if elapsed > 0 else 0.0
+                print(_progress_line(stop, n_samples, elapsed, rate), flush=True)
+                start = stop
                 continue
             lo, hi = int(inside[0]), int(inside[-1]) + 1
             t = t[lo:hi]
@@ -378,25 +523,40 @@ def _write_blocks(data, scales, zeros, channel_indices, chosen, pairs,
         for a, b in pairs:
             columns[f"{a}-{b}"] = chosen_uv[chosen.index(a)] - chosen_uv[chosen.index(b)]
 
+        read_elapsed = time.monotonic() - read_started
+        if read_tuner and span >= read_tuner.size:
+            _print_tune(read_tuner.observe(read_elapsed, span))
+
         if split_writers is not None:
             for label, handle_out in split_writers.items():
-                _write_column_block(handle_out, t, [columns[label]])
+                _write_column_block(handle_out, t, [columns[label]], tuner=write_tuner)
         else:
-            _write_column_block(wide_writer, t, [columns[label] for label in columns])
-        print(f"[mcs] {stop:,}/{n_samples:,} samples", flush=True)
+            _write_column_block(
+                wide_writer, t, [columns[label] for label in columns], tuner=write_tuner
+            )
+
+        elapsed = time.monotonic() - started
+        rate = stop / elapsed if elapsed > 0 else 0.0
+        print(_progress_line(stop, n_samples, elapsed, rate), flush=True)
+        start = stop
 
 
-WRITE_CHUNK_ROWS = 50_000
-
-
-def _write_column_block(handle, t: np.ndarray, columns: list[np.ndarray]) -> None:
+def _write_column_block(handle, t: np.ndarray, columns: list[np.ndarray],
+                        tuner: AdaptiveChunker | None = None) -> None:
     """Write time + signal columns with fixed 6-decimal formatting, chunked."""
     fmt = ",".join([TIME_FORMAT] * (len(columns) + 1))
-    for start in range(0, t.size, WRITE_CHUNK_ROWS):
-        stop = min(start + WRITE_CHUNK_ROWS, t.size)
-        rows = zip(t[start:stop], *(column[start:stop] for column in columns))
-        handle.write("\n".join(fmt % tuple(row) for row in rows))
+    start = 0
+    while start < t.size:
+        rows = min(tuner.next_size() if tuner else WRITE_CHUNK_ROWS, t.size - start)
+        stop = start + rows
+        write_started = time.monotonic()
+        values = zip(t[start:stop], *(column[start:stop] for column in columns))
+        handle.write("\n".join(fmt % tuple(row) for row in values))
         handle.write("\n")
+        write_elapsed = time.monotonic() - write_started
+        if tuner and rows >= tuner.size:
+            _print_tune(tuner.observe(write_elapsed, rows))
+        start = stop
 
 
 # -------- entry point (run this file) --------

@@ -180,5 +180,48 @@ class McsImportTests(unittest.TestCase):
             mcs.combine_mcs_to_one_csv(str(path), str(self.dir / "out.csv"))
 
 
+class AdaptiveSizingTests(unittest.TestCase):
+    def test_grows_then_halves_after_rate_drop(self):
+        tuner = mcs.AdaptiveChunker("write_chunk", initial=100, minimum=10, maximum=1000)
+        self.assertIn("growth", tuner.observe(1.0, 100))
+        self.assertEqual(tuner.next_size(), 200)
+        self.assertIn("growth", tuner.observe(0.5, 200))
+        self.assertEqual(tuner.next_size(), 400)
+
+        event = tuner.observe(4.0, 400)
+        self.assertIn("rate drop", event)
+        self.assertEqual(tuner.next_size(), 200)
+
+    def test_tune_log_names_change_rate_and_unit(self):
+        tuner = mcs.AdaptiveChunker("write_chunk", initial=100, minimum=10, maximum=1000)
+        growth = tuner.observe(1.0, 100)
+        self.assertIn("write_chunk 100 -> 200 rows", growth)
+        self.assertIn("growth", growth)
+        self.assertIn("100 rows/s", growth)
+
+        tuner.observe(0.5, 200)
+        drop = tuner.observe(4.0, 400)
+        self.assertIn("write_chunk 400 -> 200 rows", drop)
+        self.assertIn("rate drop", drop)
+        self.assertIn("% below peak", drop)
+
+    def test_respects_maximum(self):
+        tuner = mcs.AdaptiveChunker("read_block", initial=100, minimum=10, maximum=150)
+        tuner.observe(1.0, 100)
+        tuner.observe(0.1, 150)
+        self.assertEqual(tuner.next_size(), 150)
+
+    def test_progress_line_has_percent_rate_and_eta(self):
+        line = mcs._progress_line(20_600_000, 45_000_000, 192.0, 107_000)
+        self.assertIn("(45.8%)", line)
+        self.assertIn("elapsed 3:12", line)
+        self.assertIn("ETA 3:48", line)
+        self.assertIn("107k samples/s", line)
+
+    def test_progress_line_without_rate_shows_unknown_eta(self):
+        line = mcs._progress_line(0, 100, 0.0, 0.0)
+        self.assertIn("ETA --:--", line)
+
+
 if __name__ == "__main__":
     unittest.main()
