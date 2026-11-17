@@ -66,6 +66,7 @@ CSV_SPIKE_PLOT_SCRIPT = RUNTIME_ROOT / "Spike Processing" / "CSV_to_spike_counts
 SPIKE_SCRIPT = RUNTIME_ROOT / "Spike Processing" / "Spike Count Multiple CSVs ordered.py"
 RHS_SCRIPT = RUNTIME_ROOT / "Raw Conversion" / "RHS_to_CSV(simple).py"
 RHD_SCRIPT = RUNTIME_ROOT / "Raw Conversion" / "RHD_to_CSV (simple).py"
+MCS_SCRIPT = RUNTIME_ROOT / "Raw Conversion" / "MCS_to_CSV.py"
 BROWSE_START_DIR = Path(r"C:\Users\simmons\Desktop\Exploring PSDs")
 DEFAULT_DATA_DIR = BROWSE_START_DIR
 
@@ -793,6 +794,7 @@ class LocustPipelineApp:
         self.raw_channels_var = tk.StringVar(value="")
         self.raw_diff_pairs_var = tk.StringVar(value="")
         self.raw_continuous_time_var = tk.BooleanVar(value=True)
+        self.raw_split_channels_var = tk.BooleanVar(value=False)
         self.raw_time_col_var = tk.StringVar(value="time_s")
         self.raw_chunk_input_dir_var = tk.StringVar(value=str(DEFAULT_DATA_DIR / "raw_chunks"))
         self.raw_chunk_output_csv_var = tk.StringVar(value=str(DEFAULT_DATA_DIR / "combined_raw_chunks.csv"))
@@ -800,13 +802,13 @@ class LocustPipelineApp:
         self.raw_chunk_strict_time_var = tk.BooleanVar(value=True)
 
         row = 0
-        ttk.Label(settings, text="Intan format").grid(row=row, column=0, sticky="w", pady=4)
-        ttk.Combobox(settings, textvariable=self.raw_format_var, values=("RHS", "RHD"), width=12, state="readonly").grid(
+        ttk.Label(settings, text="Raw format").grid(row=row, column=0, sticky="w", pady=4)
+        ttk.Combobox(settings, textvariable=self.raw_format_var, values=("RHS", "RHD", "MCS HDF5"), width=12, state="readonly").grid(
             row=row, column=1, sticky="w", pady=4
         )
 
         row += 1
-        self._path_row(settings, row, "Raw input folder", self.raw_input_dir_var, self._browse_raw_input_dir)
+        self._path_row(settings, row, "Raw input", self.raw_input_dir_var, self._browse_raw_input_dir)
         row += 1
         self._path_row(settings, row, "Output CSV", self.raw_output_csv_var, self._browse_raw_output_csv)
 
@@ -826,6 +828,11 @@ class LocustPipelineApp:
 
         row += 1
         ttk.Checkbutton(settings, text="Continuous time across raw files", variable=self.raw_continuous_time_var).grid(
+            row=row, column=1, sticky="w", pady=4
+        )
+
+        row += 1
+        ttk.Checkbutton(settings, text="Split channels into separate CSVs (MCS only)", variable=self.raw_split_channels_var).grid(
             row=row, column=1, sticky="w", pady=4
         )
 
@@ -2155,6 +2162,16 @@ class LocustPipelineApp:
         self.worker_thread.start()
 
     def _browse_raw_input_dir(self) -> None:
+        if self.raw_format_var.get().strip().upper().startswith("MCS"):
+            path = filedialog.askopenfilename(
+                title="Choose MCS HDF5 file",
+                initialdir=self._initial_dir(self.raw_input_dir_var),
+                filetypes=[("MCS HDF5", "*.h5"), ("All files", "*.*")],
+            )
+            if path:
+                self.raw_input_dir_var.set(path)
+                self.raw_output_csv_var.set(str(Path(path).with_name(f"{Path(path).stem}_raw.csv")))
+            return
         self._browse_directory_into(self.raw_input_dir_var)
 
     def _browse_raw_output_csv(self) -> None:
@@ -2778,16 +2795,29 @@ class LocustPipelineApp:
 
     def _perform_raw_conversion(self) -> str:
         fmt = self.raw_format_var.get().strip().upper()
+        out_csv = self.raw_output_csv_var.get().strip()
+        time_col = self.raw_time_col_var.get().strip() or "time_s"
+        if fmt.startswith("MCS"):
+            module = load_script_module(MCS_SCRIPT, "mcs_to_csv_gui")
+            module.combine_mcs_to_one_csv(
+                input_path=self.raw_input_dir_var.get().strip(),
+                out_csv=out_csv,
+                target_channels=parse_csv_list(self.raw_channels_var.get()),
+                diff_pairs=parse_diff_pairs(self.raw_diff_pairs_var.get()),
+                time_col_name=time_col,
+                split_by_channel=bool(self.raw_split_channels_var.get()),
+            )
+            return out_csv
+
         script = RHS_SCRIPT if fmt == "RHS" else RHD_SCRIPT
         module = load_script_module(script, f"{fmt.lower()}_to_csv_gui")
-        out_csv = self.raw_output_csv_var.get().strip()
         module.combine_all_amplifier_to_one_csv(
             input_dir=self.raw_input_dir_var.get().strip(),
             out_csv=out_csv,
             target_channels=parse_csv_list(self.raw_channels_var.get()),
             diff_pairs=parse_diff_pairs(self.raw_diff_pairs_var.get()),
             continuous_time=bool(self.raw_continuous_time_var.get()),
-            time_col_name=self.raw_time_col_var.get().strip() or "time_s",
+            time_col_name=time_col,
         )
         return out_csv
 

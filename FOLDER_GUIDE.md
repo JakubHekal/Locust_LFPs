@@ -10,7 +10,7 @@ Spike-counting, spike-waveform, spike-amplitude, and spike-count plotting script
 LFP feature extraction, LFP plotting, low-frequency LFP scripts, and spike-LFP coupling code.
 
 ## Raw Conversion
-Intan RHD/RHS readers, raw-to-CSV conversion scripts, raw chunk combining, and Intan helper packages.
+Intan RHD/RHS readers, MCS HDF5 raw-to-CSV conversion, raw-to-CSV conversion scripts, raw chunk combining, and Intan helper packages.
 
 ## Plotting and Utilities
 Standalone plotting and utility scripts that are not specific to one spike or LFP processing step.
