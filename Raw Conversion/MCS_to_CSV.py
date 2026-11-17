@@ -31,7 +31,7 @@ import numpy as np
 
 VOLTAGE_UNITS = {"v", "mv", "uv", "µv", "μv"}
 MCS_TICK_US = 1.0  # one MCS tick is 1 microsecond
-BLOCK_SAMPLES = 1_000_000
+BLOCK_SAMPLES = 100_000
 TIME_FORMAT = "%.6f"
 
 
@@ -303,6 +303,8 @@ def combine_mcs_to_one_csv(
         print(f"[mcs] {len(chosen)} channels, {n_samples:,} samples, fs={fs:g} Hz, "
               f"segments={len(segments)}")
         print(f"[mcs] protocol v{version}")
+        print(f"[mcs] writing {n_samples:,} rows, {len(chosen) + len(pairs)} "
+              f"channels -> {out_path}", flush=True)
 
         scales = np.array([_unit_scale_to_uv(ch["unit"], ch["exponent"], ch["conversion_factor"])
                            for ch in meta], dtype=np.float64)
@@ -384,7 +386,7 @@ def _write_blocks(data, scales, zeros, channel_indices, chosen, pairs,
         print(f"[mcs] {stop:,}/{n_samples:,} samples", flush=True)
 
 
-WRITE_CHUNK_ROWS = 250_000
+WRITE_CHUNK_ROWS = 50_000
 
 
 def _write_column_block(handle, t: np.ndarray, columns: list[np.ndarray]) -> None:
